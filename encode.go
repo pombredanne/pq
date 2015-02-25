@@ -1,38 +1,44 @@
 package pq
 
 import (
+	"bytes"
 	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
-	"github.com/lib/pq/oid"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/lib/pq/oid"
 )
 
-func encode(x interface{}, pgtypOid oid.Oid) []byte {
+func encode(parameterStatus *parameterStatus, x interface{}, pgtypOid oid.Oid) []byte {
 	switch v := x.(type) {
 	case int64:
 		return []byte(fmt.Sprintf("%d", v))
-	case float32, float64:
-		return []byte(fmt.Sprintf("%f", v))
+	case float32:
+		return []byte(fmt.Sprintf("%.9f", v))
+	case float64:
+		return []byte(fmt.Sprintf("%.17f", v))
 	case []byte:
 		if pgtypOid == oid.T_bytea {
-			return []byte(fmt.Sprintf("\\x%x", v))
+			return encodeBytea(parameterStatus.serverVersion, v)
 		}
 
 		return v
 	case string:
 		if pgtypOid == oid.T_bytea {
-			return []byte(fmt.Sprintf("\\x%x", v))
+			return encodeBytea(parameterStatus.serverVersion, []byte(v))
 		}
 
 		return []byte(v)
 	case bool:
 		return []byte(fmt.Sprintf("%t", v))
 	case time.Time:
-		return []byte(v.Format(time.RFC3339Nano))
+		return formatTs(v)
+
 	default:
 		errorf("encode: unknown type for %T", v)
 	}
@@ -40,18 +46,14 @@ func encode(x interface{}, pgtypOid oid.Oid) []byte {
 	panic("not reached")
 }
 
-func decode(s []byte, typ oid.Oid) interface{} {
+func decode(parameterStatus *parameterStatus, s []byte, typ oid.Oid) interface{} {
 	switch typ {
 	case oid.T_bytea:
-		s = s[2:] // trim off "\\x"
-		d := make([]byte, hex.DecodedLen(len(s)))
-		_, err := hex.Decode(d, s)
-		if err != nil {
-			errorf("%s", err)
-		}
-		return d
-	case oid.T_timestamptz, oid.T_timestamp, oid.T_date:
-		return parseTs(string(s))
+		return parseBytea(s)
+	case oid.T_timestamptz:
+		return parseTs(parameterStatus.currentLocation, string(s))
+	case oid.T_timestamp, oid.T_date:
+		return parseTs(nil, string(s))
 	case oid.T_time:
 		return mustParse("15:04:05", typ, s)
 	case oid.T_timetz:
@@ -79,14 +81,74 @@ func decode(s []byte, typ oid.Oid) interface{} {
 	return s
 }
 
+// appendEncodedText encodes item in text format as required by COPY
+// and appends to buf
+func appendEncodedText(parameterStatus *parameterStatus, buf []byte, x interface{}) []byte {
+	switch v := x.(type) {
+	case int64:
+		return strconv.AppendInt(buf, v, 10)
+	case float32:
+		return strconv.AppendFloat(buf, float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.AppendFloat(buf, v, 'f', -1, 64)
+	case []byte:
+		encodedBytea := encodeBytea(parameterStatus.serverVersion, v)
+		return appendEscapedText(buf, string(encodedBytea))
+	case string:
+		return appendEscapedText(buf, v)
+	case bool:
+		return strconv.AppendBool(buf, v)
+	case time.Time:
+		return append(buf, formatTs(v)...)
+	case nil:
+		return append(buf, "\\N"...)
+	default:
+		errorf("encode: unknown type for %T", v)
+	}
+
+	panic("not reached")
+}
+
+func appendEscapedText(buf []byte, text string) []byte {
+	escapeNeeded := false
+	startPos := 0
+	var c byte
+
+	// check if we need to escape
+	for i := 0; i < len(text); i++ {
+		c = text[i]
+		if c == '\\' || c == '\n' || c == '\r' || c == '\t' {
+			escapeNeeded = true
+			startPos = i
+			break
+		}
+	}
+	if !escapeNeeded {
+		return append(buf, text...)
+	}
+
+	// copy till first char to escape, iterate the rest
+	result := append(buf, text[:startPos]...)
+	for i := startPos; i < len(text); i++ {
+		c = text[i]
+		switch c {
+		case '\\':
+			result = append(result, '\\', '\\')
+		case '\n':
+			result = append(result, '\\', 'n')
+		case '\r':
+			result = append(result, '\\', 'r')
+		case '\t':
+			result = append(result, '\\', 't')
+		default:
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
 func mustParse(f string, typ oid.Oid, s []byte) time.Time {
 	str := string(s)
-
-	// Special case until time.Parse bug is fixed:
-	// http://code.google.com/p/go/issues/detail?id=3487
-	if str[len(str)-2] == '.' {
-		str += "0"
-	}
 
 	// check for a 30-minute-offset timezone
 	if (typ == oid.T_timestamptz || typ == oid.T_timetz) &&
@@ -114,12 +176,106 @@ func mustAtoi(str string) int {
 	return result
 }
 
+// The location cache caches the time zones typically used by the client.
+type locationCache struct {
+	cache map[int]*time.Location
+	lock  sync.Mutex
+}
+
+// All connections share the same list of timezones. Benchmarking shows that
+// about 5% speed could be gained by putting the cache in the connection and
+// losing the mutex, at the cost of a small amount of memory and a somewhat
+// significant increase in code complexity.
+var globalLocationCache *locationCache = newLocationCache()
+
+func newLocationCache() *locationCache {
+	return &locationCache{cache: make(map[int]*time.Location)}
+}
+
+// Returns the cached timezone for the specified offset, creating and caching
+// it if necessary.
+func (c *locationCache) getLocation(offset int) *time.Location {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	location, ok := c.cache[offset]
+	if !ok {
+		location = time.FixedZone("", offset)
+		c.cache[offset] = location
+	}
+
+	return location
+}
+
+var infinityTsEnabled = false
+var infinityTsNegative time.Time
+var infinityTsPositive time.Time
+
+const (
+	infinityTsEnabledAlready        = "pq: infinity timestamp enabled already"
+	infinityTsNegativeMustBeSmaller = "pq: infinity timestamp: negative value must be smaller (before) than positive"
+)
+
+/*
+ * If EnableInfinityTs is not called, "-infinity" and "infinity" will return
+ * []byte("-infinity") and []byte("infinity") respectively, and potentially
+ * cause error "sql: Scan error on column index 0: unsupported driver -> Scan pair: []uint8 -> *time.Time",
+ * when scanning into a time.Time value.
+ *
+ * Once EnableInfinityTs has been called, all connections created using this
+ * driver will decode Postgres' "-infinity" and "infinity" for "timestamp",
+ * "timestamp with time zone" and "date" types to the predefined minimum and
+ * maximum times, respectively.  When encoding time.Time values, any time which
+ * equals or preceeds the predefined minimum time will be encoded to
+ * "-infinity".  Any values at or past the maximum time will similarly be
+ * encoded to "infinity".
+ *
+ *
+ * If EnableInfinityTs is called with negative >= positive, it will panic.
+ * Calling EnableInfinityTs after a connection has been established results in
+ * undefined behavior.  If EnableInfinityTs is called more than once, it will
+ * panic.
+ */
+func EnableInfinityTs(negative time.Time, positive time.Time) {
+	if infinityTsEnabled {
+		panic(infinityTsEnabledAlready)
+	}
+	if !negative.Before(positive) {
+		panic(infinityTsNegativeMustBeSmaller)
+	}
+	infinityTsEnabled = true
+	infinityTsNegative = negative
+	infinityTsPositive = positive
+}
+
+/*
+ * Testing might want to toggle infinityTsEnabled
+ */
+func disableInfinityTs() {
+	infinityTsEnabled = false
+}
+
 // This is a time function specific to the Postgres default DateStyle
 // setting ("ISO, MDY"), the only one we currently support. This
 // accounts for the discrepancies between the parsing available with
 // time.Parse and the Postgres date formatting quirks.
-func parseTs(str string) (result time.Time) {
+func parseTs(currentLocation *time.Location, str string) interface{} {
+	switch str {
+	case "-infinity":
+		if infinityTsEnabled {
+			return infinityTsNegative
+		}
+		return []byte(str)
+	case "infinity":
+		if infinityTsEnabled {
+			return infinityTsPositive
+		}
+		return []byte(str)
+	}
+
 	monSep := strings.IndexRune(str, '-')
+	// this is Gregorian year, not ISO Year
+	// In Gregorian system, the year 1 BC is followed by AD 1
 	year := mustAtoi(str[:monSep])
 	daySep := monSep + 3
 	month := mustAtoi(str[monSep+1 : daySep])
@@ -147,7 +303,6 @@ func parseTs(str string) (result time.Time) {
 
 	nanoSec := 0
 	tzOff := 0
-	bcSign := 1
 
 	if remainderIdx < len(str) && str[remainderIdx:remainderIdx+1] == "." {
 		fracStart := remainderIdx + 1
@@ -181,18 +336,150 @@ func parseTs(str string) (result time.Time) {
 			tzSec = mustAtoi(str[tzStart+7 : tzStart+9])
 			remainderIdx += 3
 		}
-		tzOff = (tzSign * tzHours * (60 * 60)) + (tzMin * 60) + tzSec
+		tzOff = tzSign * ((tzHours * 60 * 60) + (tzMin * 60) + tzSec)
 	}
+	var isoYear int
 	if remainderIdx < len(str) && str[remainderIdx:remainderIdx+3] == " BC" {
-		bcSign = -1
+		isoYear = 1 - year
 		remainderIdx += 3
+	} else {
+		isoYear = year
 	}
 	if remainderIdx < len(str) {
 		errorf("expected end of input, got %v", str[remainderIdx:])
 	}
-	return time.Date(bcSign*year, time.Month(month), day,
+	t := time.Date(isoYear, time.Month(month), day,
 		hour, minute, second, nanoSec,
-		time.FixedZone("", tzOff))
+		globalLocationCache.getLocation(tzOff))
+
+	if currentLocation != nil {
+		// Set the location of the returned Time based on the session's
+		// TimeZone value, but only if the local time zone database agrees with
+		// the remote database on the offset.
+		lt := t.In(currentLocation)
+		_, newOff := lt.Zone()
+		if newOff == tzOff {
+			t = lt
+		}
+	}
+
+	return t
+}
+
+// formatTs formats t into a format postgres understands.
+func formatTs(t time.Time) (b []byte) {
+	if infinityTsEnabled {
+		// t <= -infinity : ! (t > -infinity)
+		if !t.After(infinityTsNegative) {
+			return []byte("-infinity")
+		}
+		// t >= infinity : ! (!t < infinity)
+		if !t.Before(infinityTsPositive) {
+			return []byte("infinity")
+		}
+	}
+	// Need to send dates before 0001 A.D. with " BC" suffix, instead of the
+	// minus sign preferred by Go.
+	// Beware, "0000" in ISO is "1 BC", "-0001" is "2 BC" and so on
+	bc := false
+	if t.Year() <= 0 {
+		// flip year sign, and add 1, e.g: "0" will be "1", and "-10" will be "11"
+		t = t.AddDate((-t.Year())*2+1, 0, 0)
+		bc = true
+	}
+	b = []byte(t.Format(time.RFC3339Nano))
+
+	_, offset := t.Zone()
+	offset = offset % 60
+	if offset != 0 {
+		// RFC3339Nano already printed the minus sign
+		if offset < 0 {
+			offset = -offset
+		}
+
+		b = append(b, ':')
+		if offset < 10 {
+			b = append(b, '0')
+		}
+		b = strconv.AppendInt(b, int64(offset), 10)
+	}
+
+	if bc {
+		b = append(b, " BC"...)
+	}
+	return b
+}
+
+// Parse a bytea value received from the server.  Both "hex" and the legacy
+// "escape" format are supported.
+func parseBytea(s []byte) (result []byte) {
+	if len(s) >= 2 && bytes.Equal(s[:2], []byte("\\x")) {
+		// bytea_output = hex
+		s = s[2:] // trim off leading "\\x"
+		result = make([]byte, hex.DecodedLen(len(s)))
+		_, err := hex.Decode(result, s)
+		if err != nil {
+			errorf("%s", err)
+		}
+	} else {
+		// bytea_output = escape
+		for len(s) > 0 {
+			if s[0] == '\\' {
+				// escaped '\\'
+				if len(s) >= 2 && s[1] == '\\' {
+					result = append(result, '\\')
+					s = s[2:]
+					continue
+				}
+
+				// '\\' followed by an octal number
+				if len(s) < 4 {
+					errorf("invalid bytea sequence %v", s)
+				}
+				r, err := strconv.ParseInt(string(s[1:4]), 8, 9)
+				if err != nil {
+					errorf("could not parse bytea value: %s", err.Error())
+				}
+				result = append(result, byte(r))
+				s = s[4:]
+			} else {
+				// We hit an unescaped, raw byte.  Try to read in as many as
+				// possible in one go.
+				i := bytes.IndexByte(s, '\\')
+				if i == -1 {
+					result = append(result, s...)
+					break
+				}
+				result = append(result, s[:i]...)
+				s = s[i:]
+			}
+		}
+	}
+
+	return result
+}
+
+func encodeBytea(serverVersion int, v []byte) (result []byte) {
+	if serverVersion >= 90000 {
+		// Use the hex format if we know that the server supports it
+		result = make([]byte, 2+hex.EncodedLen(len(v)))
+		result[0] = '\\'
+		result[1] = 'x'
+		hex.Encode(result[2:], v)
+	} else {
+		// .. or resort to "escape"
+		for _, b := range v {
+			if b == '\\' {
+				result = append(result, '\\', '\\')
+			} else if b < 0x20 || b > 0x7e {
+				result = append(result, []byte(fmt.Sprintf("\\%03o", b))...)
+			} else {
+				result = append(result, b)
+			}
+		}
+	}
+
+	return result
 }
 
 // NullTime represents a time.Time that may be null. NullTime implements the
